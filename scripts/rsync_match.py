@@ -16,14 +16,23 @@ Notes:
 - Strong checksum is MD5 **digest bytes** (not hex) for faster compare.
 - Streaming variant emits **single-block** COPY (length = B); LIT spans are variable.
 - LRU cache stores weak→[(strong_digest_bytes, old_offset), ...] lists to reduce per-byte SQL.
+
+Colab-friendly changes:
+- O(1) LRU via OrderedDict
+- Tunable SQLite PRAGMAs via env vars:
+    RSYNC_SQLITE_CACHE_KIB  (default 262144 = 256 MiB)
+    RSYNC_SQLITE_PAGE_SIZE  (default 32768)
+    RSYNC_SQLITE_MMAP_SIZE  (default 268435456 = 256 MiB)
 """
 
 from __future__ import annotations
 import hashlib
 import io
+import os
 import sqlite3
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Tuple, Optional
+from collections import OrderedDict
 
 
 # =======================
@@ -63,21 +72,37 @@ class RollingChecksum:
 # SQLite index schema
 # ===================
 
+def _pragma_int(env: str, default: int) -> int:
+    val = os.getenv(env, "")
+    try:
+        return int(val) if val else default
+    except Exception:
+        return default
+
 def _init_db(conn: sqlite3.Connection) -> None:
     """
     Initialize a per-old-file index DB with performance-friendly PRAGMAs.
     These DBs are disposable; we favor throughput over durability.
+
+    Tunables (env):
+      RSYNC_SQLITE_CACHE_KIB (negative means KiB page cache target)
+      RSYNC_SQLITE_PAGE_SIZE (bytes)
+      RSYNC_SQLITE_MMAP_SIZE (bytes)
     """
+    cache_kib = _pragma_int("RSYNC_SQLITE_CACHE_KIB", 262144)      # 256 MiB (vs. prior 1 GiB)
+    page_size = _pragma_int("RSYNC_SQLITE_PAGE_SIZE", 32768)       # 32 KiB
+    mmap_size = _pragma_int("RSYNC_SQLITE_MMAP_SIZE", 268435456)   # 256 MiB
+
     cur = conn.cursor()
-    # Pragmas tuned for fast, throwaway indexing/scanning (NVMe-friendly; fine on HDD too)
-    cur.executescript("""
+    # Set page_size before creating tables for best effect
+    cur.executescript(f"""
+        PRAGMA page_size={page_size};
         PRAGMA journal_mode=OFF;
         PRAGMA synchronous=OFF;
         PRAGMA temp_store=MEMORY;
-        PRAGMA cache_size=-1048576;      -- ~1 GiB page cache if RAM allows (negative = KB)
-        PRAGMA page_size=32768;          -- larger pages reduce I/O
-        PRAGMA mmap_size=536870912;      -- 512 MiB mmap window if available
-        PRAGMA locking_mode=EXCLUSIVE;   -- fewer fsync/lock transitions
+        PRAGMA cache_size=-{cache_kib};
+        PRAGMA mmap_size={mmap_size};
+        PRAGMA locking_mode=EXCLUSIVE;
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meta(
@@ -189,53 +214,38 @@ def _load_block_size(conn: sqlite3.Connection) -> int:
 
 class _LRU:
     """
-    Simple LRU for weak -> candidate list.
+    O(1) LRU for weak -> candidate list using OrderedDict.
     Stores: weak:int -> List[(strong_digest:bytes, off:int)]
     """
-    __slots__ = ("cap", "dict", "order")
+    __slots__ = ("cap", "odict")
 
     def __init__(self, capacity: int):
         self.cap = max(1, capacity)
-        self.dict: Dict[int, List[Tuple[bytes, int]]] = {}
-        self.order: List[int] = []  # most-recent at end
+        self.odict: "OrderedDict[int, List[Tuple[bytes, int]]]" = OrderedDict()
 
     def get(self, k: int) -> Optional[List[Tuple[bytes, int]]]:
-        v = self.dict.get(k)
+        od = self.odict
+        v = od.get(k)
         if v is not None:
-            # move to MRU
-            try:
-                i = self.order.index(k)
-                self.order.pop(i)
-            except ValueError:
-                pass
-            self.order.append(k)
+            od.move_to_end(k, last=True)  # MRU at end
         return v
 
     def put(self, k: int, v: List[Tuple[bytes, int]]) -> None:
-        if k in self.dict:
-            self.dict[k] = v
-            try:
-                i = self.order.index(k)
-                self.order.pop(i)
-            except ValueError:
-                pass
-            self.order.append(k)
-            return
-        # new insert
-        self.dict[k] = v
-        self.order.append(k)
-        if len(self.dict) > self.cap:
-            # evict LRU
-            oldk = self.order.pop(0)
-            self.dict.pop(oldk, None)
+        od = self.odict
+        if k in od:
+            od[k] = v
+            od.move_to_end(k, last=True)
+        else:
+            od[k] = v
+            if len(od) > self.cap:
+                od.popitem(last=False)  # evict LRU
 
 
 def _cands_for_weak_cached(conn: sqlite3.Connection, lru: _LRU, weak: int) -> List[Tuple[bytes, int]]:
     hit = lru.get(weak)
     if hit is not None:
         return hit
-    cur = conn.cursor()
-    rows = cur.execute("SELECT strong, off FROM blocks WHERE weak=?", (weak,)).fetchall()
+    rows = conn.execute("SELECT strong, off FROM blocks WHERE weak=?", (weak,)).fetchall()
     cands = [(bytes(r[0]), int(r[1])) for r in rows] if rows else []
     lru.put(weak, cands)
     return cands
@@ -271,8 +281,7 @@ def iter_matches_and_unmatched(new_bytes: bytes, idx_path: str, block_size: int)
 
         # load all cands into a dict (for small cases)
         idx_map: Dict[int, List[Tuple[bytes, int]]] = {}
-        cur = conn.cursor()
-        for weak, strong, off in cur.execute("SELECT weak, strong, off FROM blocks"):
+        for weak, strong, off in conn.execute("SELECT weak, strong, off FROM blocks"):
             lst = idx_map.get(weak)
             if lst is None:
                 idx_map[weak] = [(bytes(strong), int(off))]
@@ -421,3 +430,4 @@ def iter_matches_and_unmatched_stream_sqlcached(
             yield ("lit", out_lit_start, pos - out_lit_start)
     finally:
         conn.close()
+
