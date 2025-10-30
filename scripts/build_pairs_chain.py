@@ -84,7 +84,8 @@ def _common_members(old_tar: tarfile.TarFile, new_tar: tarfile.TarFile) -> List[
     common_norm = set(old_map.keys()) & set(new_map.keys())
     pairs = [(old_map[n], new_map[n], size_map.get(n, 0)) for n in common_norm]
     # Sort largest NEW first for better worker balance on NVMe/Colab
-    pairs.sort(key=lambda t: t[2], reverse=True)
+    #pairs.sort(key=lambda t: t[2], reverse=True)
+    pairs.sort(key=lambda t: t[2])  # smallest → largest
     return pairs
 
 # =============== Literal emission (coalesced) ===============
