@@ -36,26 +36,27 @@ def _fmt_dur(sec: float) -> str:
 
 # =============== Member matching (normalized) ===============
 
-def _common_members(old_tar: tarfile.TarFile, new_tar: tarfile.TarFile) -> List[Tuple[str, str]]:
-    """
-    Return list of (old_member_name, new_member_name) for files that match after
-    stripping the top-level directory prefix (e.g., 'linux-6.1.154/').
-    """
+def _common_members(old_tar, new_tar):
     def norm(name: str) -> str:
         return name.split("/", 1)[1] if "/" in name else name
 
     old_map = {}
     for m in old_tar.getmembers():
         if m.isfile():
-            old_map.setdefault(norm(m.name), m.name)
+            old_map.setdefault(norm(m.name), (m.name, m.size))
 
     new_map = {}
     for m in new_tar.getmembers():
         if m.isfile():
-            new_map.setdefault(norm(m.name), m.name)
+            new_map.setdefault(norm(m.name), (m.name, m.size))
 
-    common_norm = sorted(set(old_map.keys()) & set(new_map.keys()))
-    return [(old_map[n], new_map[n]) for n in common_norm]
+    common_norm = set(old_map.keys()) & set(new_map.keys())
+    # (old_name, new_name, new_size)
+    pairs = [(old_map[n][0], new_map[n][0], new_map[n][1]) for n in common_norm]
+    # sort by NEW size asc so we get quick wins
+    pairs.sort(key=lambda x: x[2])
+    return pairs
+
 
 # =============== OLD lookup (skip-if-present-anywhere) ===============
 
