@@ -277,7 +277,7 @@ def main():
 
     tasks = [
         (old_tar_path, new_tar_path, old_name, new_name, B, stride, args.cache_size, tmp_dir)
-        for (old_name, new_name) in pairs
+        for (old_name, new_name, _sz) in pairs
     ]
 
     def _status(done: int, total: int):
