@@ -4,6 +4,7 @@ import argparse, base64, json, os, tarfile, tempfile, uuid, time, sqlite3, hashl
 from typing import Iterator, Tuple, Optional, List
 from multiprocessing import Pool, cpu_count
 from bisect import bisect_right
+from contextlib import nullcontext
 
 from rsync_match import (
     build_source_index_sqlite_stream,
@@ -251,6 +252,7 @@ def main():
     ap.add_argument("--progress_every", type=int, default=500, help="Print progress every N members")
     ap.add_argument("--cache_size", type=int, default=65536, help="LRU size for weak→candidates in streaming matcher")
     ap.add_argument("--pool_chunksize", type=int, default=64, help="chunksize for imap_unordered batching")
+    ap.add_argument("--tqdm", action="store_true", help="Show a tqdm progress bar")
     args = ap.parse_args()
 
     B = args.block_size
@@ -289,15 +291,37 @@ def main():
     total_pairs = 0
     progress = 0
     with Pool(processes=args.jobs) as pool:
-        for res in pool.imap_unordered(_process_member, tasks, chunksize=args.pool_chunksize):
-            progress += 1
-            if res is not None:
-                out_path, written = res
-                total_pairs += written
-            if progress % args.progress_every == 0:
-                _status(progress, total_members)
+        iterator = pool.imap_unordered(_process_member, tasks, chunksize=args.pool_chunksize)
 
-    _status(progress, total_members)
+        # pick a context manager: tqdm or no-op
+        bar_cm = nullcontext()
+        if args.tqdm:
+            try:
+                from tqdm import tqdm
+                bar_cm = tqdm(total=total_members, unit="file", dynamic_ncols=True, desc="Members")
+            except Exception:
+                pass  # fallback to prints if tqdm unavailable
+
+        # drive the iterator and update either tqdm or periodic prints
+        if args.tqdm and isinstance(bar_cm, object) and hasattr(bar_cm, "update"):
+            with bar_cm as pbar:
+                for res in iterator:
+                    progress += 1
+                    if res is not None:
+                        out_path, written = res
+                        total_pairs += written
+                    pbar.update(1)
+        else:
+            # original print-based progress
+            for res in iterator:
+                progress += 1
+                if res is not None:
+                    out_path, written = res
+                    total_pairs += written
+                if progress % args.progress_every == 0:
+                    _status(progress, total_members)
+
+   # _status(progress, total_members)
     print(f"[info] concatenating shards → {args.out}")
 
     out_dir = os.path.dirname(args.out)
