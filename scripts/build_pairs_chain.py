@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# Option A — Literal spans → tiled, changed-only pairs
+# scripts/build_pairs_chain.py
+# Option A — Literal spans → tiled, changed-only pairs (with valid-lengths for masking)
+
 import argparse, base64, json, os, tarfile, tempfile, uuid, time, sqlite3, hashlib
 from typing import Iterator, Tuple, Optional, List
 from multiprocessing import Pool, cpu_count
@@ -8,13 +10,14 @@ from contextlib import nullcontext
 
 from rsync_match import (
     build_source_index_sqlite_stream,
-    iter_matches_and_unmatched_stream_sqlcached,  # streaming matcher with LRU
+    iter_matches_and_unmatched_stream_sqlcached,  # streaming matcher with LRU cache
     RollingChecksum,
 )
 
-# =============== Utilities ===============
+# ===================== Utilities =====================
 
 def _ensure_seekable(fobj):
+    """Return a seekable file-like object; spill to a temp file if needed."""
     try:
         fobj.seek(0, os.SEEK_CUR)
         return fobj
@@ -34,9 +37,31 @@ def _fmt_dur(sec: float) -> str:
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}"
 
-# =============== Member matching (normalized) ===============
+def _read_exact_with_pad(f, off: int, ln: int) -> bytes:
+    """
+    Read [off, off+ln) from seekable 'f'. If off<0 or past EOF, pad with zeros to ln.
+    """
+    if off < 0:
+        pad = -off
+        f.seek(0)
+        data = f.read(max(0, ln - pad)) or b""
+        if len(data) < ln - pad:
+            data = data + bytes((ln - pad) - len(data))
+        return b"\x00" * pad + data
+    f.seek(off)
+    data = f.read(ln) or b""
+    if len(data) < ln:
+        data = data + bytes(ln - len(data))
+    return data
 
-def _common_members(old_tar, new_tar):
+# =========== Member matching (normalized names) ===========
+
+def _common_members(old_tar: tarfile.TarFile, new_tar: tarfile.TarFile) -> List[Tuple[str, str, int]]:
+    """
+    Return list of (old_member_name, new_member_name, new_size), matching after
+    stripping the top-level directory prefix (e.g., 'linux-6.1.154/').
+    Sorted by NEW size ascending so we get quick completions first.
+    """
     def norm(name: str) -> str:
         return name.split("/", 1)[1] if "/" in name else name
 
@@ -51,19 +76,16 @@ def _common_members(old_tar, new_tar):
             new_map.setdefault(norm(m.name), (m.name, m.size))
 
     common_norm = set(old_map.keys()) & set(new_map.keys())
-    # (old_name, new_name, new_size)
-    pairs = [(old_map[n][0], new_map[n][0], new_map[n][1]) for n in common_norm]
-    # sort by NEW size asc so we get quick wins
-    pairs.sort(key=lambda x: x[2])
+    pairs = [(old_map[n][0], new_map[n][0], int(new_map[n][1])) for n in common_norm]
+    pairs.sort(key=lambda x: x[2])  # NEW size asc
     return pairs
 
-
-# =============== OLD lookup (skip-if-present-anywhere) ===============
+# ======== OLD lookup (skip-if-present-anywhere in OLD) ========
 
 def make_old_block_lookup(idx_path: str, block_size: int, cache_cap: int = 8192):
     """
     Return lookup(new_blk[B]) -> old_off or None, using the per-member SQLite index.
-    Pads to B before hashing (the index was built on padded B blocks).
+    Pads to B before hashing (the index is built on padded B blocks).
     """
     conn = sqlite3.connect(idx_path, check_same_thread=False)
     cur = conn.cursor()
@@ -90,18 +112,18 @@ def make_old_block_lookup(idx_path: str, block_size: int, cache_cap: int = 8192)
 
     return lookup
 
-# =============== Anchor helpers ===============
+# ===================== Anchor helpers =====================
 
 def build_anchor_maps(regions: List[Tuple]) -> Tuple[List[int], List[Tuple[int,int]]]:
     """
-    From matcher regions, collect COPY anchors as (n_pos, o_pos) lists.
+    From matcher regions, collect COPY anchors as (n_pos, o_pos) along NEW.
     Returns (copy_positions_in_new, anchors list).
     """
     anchors: List[Tuple[int,int]] = []
     for r in regions:
         if r[0] == "copy":
             _, nstart, nlen, ostart = r
-            anchors.append((nstart, ostart))
+            anchors.append((int(nstart), int(ostart)))
     anchors.sort(key=lambda x: x[0])
     copy_positions = [a[0] for a in anchors]
     return copy_positions, anchors
@@ -127,107 +149,126 @@ def bi_anchor_map(n: int, pa: Optional[Tuple[int,int]], na: Optional[Tuple[int,i
     ratio = (n - n0) / float(n1 - n0)
     return int(round(o0 + ratio * (o1 - o0)))
 
-# =============== Tiling emitter (Option A) ===============
+# ============== Tiling emitter (Option A, with valid lengths) ==============
 
-def emit_changed_tiles(old_seek, new_seek,
+def emit_changed_tiles(old_seek,
+                       new_seek,
                        regions: List[Tuple],
-                       B: int, stride: int,
-                       lookup_old_off) -> Iterator[Tuple[bytes, bytes]]:
+                       B: int,
+                       stride: int,
+                       lookup_old_off,
+                       old_size: int,
+                       new_size: int
+                       ) -> Iterator[Tuple[bytes, bytes, int, int]]:
     """
-    Option A: iterate LITERAL spans, tile them into fixed B targets with given stride,
-    skip tiles that exist anywhere in OLD (lookup hit), and map NEW→OLD with
-    bi-anchored interpolation; fallback to same-offset if no anchors.
+    Iterate LITERAL spans, tile them into fixed B targets with 'stride',
+    skip tiles that exist anywhere in OLD (lookup hit),
+    map NEW→OLD via COPY anchors (bi-anchored) else same-offset fallback.
 
-    Yields (old_chunk[B], new_chunk[B])
+    Yields (old_chunk[B], new_chunk[B], old_valid, new_valid)
     """
     copy_positions, anchors = build_anchor_maps(regions)
-
-    def read_exact(f, off: int, ln: int) -> bytes:
-        if off < 0:
-            pad = -off
-            f.seek(0)
-            data = f.read(max(0, ln - pad)) or b""
-            if len(data) < ln - pad:
-                data = data + bytes(ln - pad - len(data))
-            return b"\x00" * pad + data
-        f.seek(off)
-        data = f.read(ln) or b""
-        if len(data) < ln:
-            data = data + bytes(ln - len(data))
-        return data
 
     for r in regions:
         if r[0] != "lit":
             continue
         _, nstart, nlen = r
+        nstart = int(nstart); nlen = int(nlen)
         end = nstart + nlen
         pos = nstart
-        while pos < end:
-            # NEW tile
-            new_chunk = read_exact(new_seek, pos, B)
 
-            # Skip if NEW tile exists anywhere in OLD (unchanged/shifted)
+        while pos < end:
+            # NEW tile: real NEW bytes before padding
+            take = min(B, end - pos)
+            new_valid = take
+            new_chunk = _read_exact_with_pad(new_seek, pos, B)
+
+            # Skip if NEW tile exists anywhere in OLD (unchanged or shifted copy)
             if lookup_old_off(new_chunk) is not None:
                 pos += stride
                 continue
 
-            # Map NEW position to OLD via anchors
+            # Map NEW position to OLD via anchors; fallback to same-offset
             pa = prev_anchor(pos, copy_positions, anchors)
             na = next_anchor(pos, copy_positions, anchors)
             o_start = bi_anchor_map(pos, pa, na)
             if o_start is None:
-                o_start = max(0, pos)  # same-offset fallback
+                o_start = max(0, pos)
 
-            old_chunk = read_exact(old_seek, o_start, B)
-            yield old_chunk, new_chunk
+            # OLD tile + valid length (cap by file size)
+            if o_start >= old_size:
+                old_valid = 0
+            else:
+                old_valid = min(B, old_size - o_start)
+            old_chunk = _read_exact_with_pad(old_seek, o_start, B)
 
+            yield old_chunk, new_chunk, int(old_valid), int(new_valid)
             pos += stride
 
-# =============== Worker (per member) ===============
+# ===================== Worker (per member) =====================
 
 def _process_member(args):
-    (old_tar_path, new_tar_path, old_member_name, new_member_name,
-     B, stride, cache_size, tmp_dir) = args
+    (
+        old_tar_path, new_tar_path,
+        old_member_name, new_member_name,
+        B, stride, cache_size, tmp_dir
+    ) = args
+
+    # print a tiny heartbeat for long members
+    print(f"[worker] starting: {new_member_name}", flush=True)
 
     with tarfile.open(old_tar_path, "r:*") as told, tarfile.open(new_tar_path, "r:*") as tnew:
         om = told.getmember(old_member_name)
         nm = tnew.getmember(new_member_name)
+        # Only process regular files with size > 0 in NEW
         if not om.isfile() or not nm.isfile() or nm.size == 0:
+            print(f"[worker] skip: {new_member_name}", flush=True)
             return None
+
+        old_size = int(om.size)
+        new_size = int(nm.size)
 
         of = told.extractfile(om)
         nf = tnew.extractfile(nm)
         if of is None or nf is None:
+            print(f"[worker] no streams: {new_member_name}", flush=True)
             return None
 
         of = _ensure_seekable(of)
         nf = _ensure_seekable(nf)
 
-        # 1) Build OLD index (SQLite)
+        # 1) Build OLD per-member index (SQLite)
         idx_path = os.path.join(tmp_dir, f"idx_{uuid.uuid4().hex}.sqlite")
         of.seek(0)
         build_source_index_sqlite_stream(of, idx_path, block_size=B)
         of.seek(0)
 
-        # 2) Stream NEW to get regions (COPY/LITERAL)
+        # 2) Stream NEW to get COPY/LITERAL regions
         nf.seek(0)
-        regions = list(iter_matches_and_unmatched_stream_sqlcached(
-            nf, idx_path, block_size=B, cache_size=cache_size
-        ))
+        regions = list(
+            iter_matches_and_unmatched_stream_sqlcached(
+                nf, idx_path, block_size=B, cache_size=cache_size
+            )
+        )
 
-        # 3) Emit changed-only tiles
-        lookup = make_old_block_lookup(idx_path, B)
+        # 3) Emit changed-only tiles with valid lengths
+        lookup = make_old_block_lookup(idx_path, B, cache_cap=8192)
         nf.seek(0); of.seek(0)
 
         out_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}.jsonl")
         written = 0
         with open(out_path, "w", encoding="utf-8") as fout:
-            for old_chunk, new_chunk in emit_changed_tiles(
-                of, nf, regions, B=B, stride=stride, lookup_old_off=lookup
+            for old_chunk, new_chunk, old_valid, new_valid in emit_changed_tiles(
+                of, nf, regions, B=B, stride=stride, lookup_old_off=lookup,
+                old_size=old_size, new_size=new_size
             ):
                 rec = {
                     "old": base64.b64encode(old_chunk).decode("ascii"),
                     "new": base64.b64encode(new_chunk).decode("ascii"),
+                    "old_valid": int(old_valid),
+                    "new_valid": int(new_valid),
+                    "block": int(B),
+                    "stride": int(stride),
                     "member_old": old_member_name,
                     "member_new": new_member_name,
                 }
@@ -235,35 +276,37 @@ def _process_member(args):
                 written += 1
 
         # Clean index early
-        try: os.remove(idx_path)
-        except Exception: pass
+        try:
+            os.remove(idx_path)
+        except Exception:
+            pass
 
-        return (out_path, written)
+    print(f"[worker] done: {new_member_name} (pairs={written})", flush=True)
+    return (out_path, written)
 
-# =============== Main ===============
+# ===================== Main =====================
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Build OLD→NEW training pairs from rsync-style literal spans (Option A)")
     ap.add_argument("--block_size", type=int, default=4096, help="Tile size B (and rsync index block)")
-    ap.add_argument("--stride", type=int, default=4096, help="Tile stride (B for no overlap, B//2 for 50% overlap)")
-    ap.add_argument("--out", required=True, help="Output JSONL of {old,new} base64 pairs (B bytes each)")
+    ap.add_argument("--stride", type=int, default=4096, help="Tile stride (B=no overlap, B//2=50% overlap)")
+    ap.add_argument("--out", required=True, help="Output JSONL of {old,new,old_valid,new_valid,...} pairs")
     ap.add_argument("--chain", nargs=2, required=True, help="Exactly two tar paths: OLD.tar NEW.tar")
-    ap.add_argument("--jobs", type=int, default=max(1, cpu_count()-1))
+    ap.add_argument("--jobs", type=int, default=max(1, cpu_count()-1), help="Parallel workers")
     ap.add_argument("--limit", type=int, default=0, help="(Debug) limit number of members processed")
-    ap.add_argument("--progress_every", type=int, default=500, help="Print progress every N members")
+    ap.add_argument("--progress_every", type=int, default=500, help="Print progress every N members (when --tqdm not used)")
     ap.add_argument("--cache_size", type=int, default=65536, help="LRU size for weak→candidates in streaming matcher")
-    ap.add_argument("--pool_chunksize", type=int, default=64, help="chunksize for imap_unordered batching")
+    ap.add_argument("--pool_chunksize", type=int, default=1, help="chunksize for imap_unordered batching (1 = most responsive)")
     ap.add_argument("--tqdm", action="store_true", help="Show a tqdm progress bar")
     args = ap.parse_args()
 
-    B = args.block_size
-    stride = args.stride if args.stride > 0 else B
-
+    B = int(args.block_size)
+    stride = int(args.stride) if args.stride > 0 else B
     old_tar_path, new_tar_path = args.chain
 
     t0 = time.time()
     with tarfile.open(old_tar_path, "r:*") as told, tarfile.open(new_tar_path, "r:*") as tnew:
-        pairs = _common_members(told, tnew)
+        pairs = _common_members(told, tnew)  # (old_name, new_name, new_size)
 
     if args.limit > 0:
         pairs = pairs[: args.limit]
@@ -280,6 +323,7 @@ def main():
         for (old_name, new_name, _sz) in pairs
     ]
 
+    # Progress helpers
     def _status(done: int, total: int):
         elapsed = time.time() - t0
         rate = done / elapsed if elapsed > 0 and done > 0 else 0.0
@@ -294,18 +338,18 @@ def main():
     with Pool(processes=args.jobs) as pool:
         iterator = pool.imap_unordered(_process_member, tasks, chunksize=args.pool_chunksize)
 
-        # pick a context manager: tqdm or no-op
+        # Optional tqdm progress bar
         bar_cm = nullcontext()
+        pbar = None
         if args.tqdm:
             try:
                 from tqdm import tqdm
-                bar_cm = tqdm(total=total_members, unit="file", dynamic_ncols=True, desc="Members")
+                pbar = tqdm(total=total_members, unit="file", dynamic_ncols=True, desc="Members")
             except Exception:
-                pass  # fallback to prints if tqdm unavailable
+                pbar = None
 
-        # drive the iterator and update either tqdm or periodic prints
-        if args.tqdm and isinstance(bar_cm, object) and hasattr(bar_cm, "update"):
-            with bar_cm as pbar:
+        if pbar is not None:
+            with pbar:
                 for res in iterator:
                     progress += 1
                     if res is not None:
@@ -313,7 +357,6 @@ def main():
                         total_pairs += written
                     pbar.update(1)
         else:
-            # original print-based progress
             for res in iterator:
                 progress += 1
                 if res is not None:
@@ -322,13 +365,17 @@ def main():
                 if progress % args.progress_every == 0:
                     _status(progress, total_members)
 
-   # _status(progress, total_members)
+    # Final status
+    if pbar is None:
+        _status(progress, total_members)
     print(f"[info] concatenating shards → {args.out}")
 
+    # Ensure out dir
     out_dir = os.path.dirname(args.out)
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
 
+    # Concatenate per-worker shards
     with open(args.out, "w", encoding="utf-8") as fout:
         for fname in os.listdir(tmp_dir):
             if not fname.endswith(".jsonl"):
@@ -337,17 +384,20 @@ def main():
                 for line in fin:
                     fout.write(line)
 
-    # Cleanup
+    # Cleanup temp shards
     for fname in os.listdir(tmp_dir):
-        try: os.remove(os.path.join(tmp_dir, fname))
-        except Exception: pass
-    try: os.rmdir(tmp_dir)
-    except Exception: pass
+        try:
+            os.remove(os.path.join(tmp_dir, fname))
+        except Exception:
+            pass
+    try:
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
 
     print(f"[done] Wrote {total_pairs} changed-only pairs (B={B}, stride={stride}, jobs={args.jobs}) → {args.out}")
     print(f"[time] total elapsed = {_fmt_dur(time.time() - t0)}")
 
 if __name__ == "__main__":
     main()
-
 
