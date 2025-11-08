@@ -215,7 +215,7 @@ def _process_member(args):
     ) = args
 
     # print a tiny heartbeat for long members
-    print(f"[worker] starting: {new_member_name}", flush=True)
+    #print(f"[worker] starting: {new_member_name}", flush=True)
 
     with tarfile.open(old_tar_path, "r:*") as told, tarfile.open(new_tar_path, "r:*") as tnew:
         om = told.getmember(old_member_name)
