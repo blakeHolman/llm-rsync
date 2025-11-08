@@ -222,7 +222,7 @@ def _process_member(args):
         nm = tnew.getmember(new_member_name)
         # Only process regular files with size > 0 in NEW
         if not om.isfile() or not nm.isfile() or nm.size == 0:
-            print(f"[worker] skip: {new_member_name}", flush=True)
+            #print(f"[worker] skip: {new_member_name}", flush=True)
             return None
 
         old_size = int(om.size)
@@ -231,7 +231,7 @@ def _process_member(args):
         of = told.extractfile(om)
         nf = tnew.extractfile(nm)
         if of is None or nf is None:
-            print(f"[worker] no streams: {new_member_name}", flush=True)
+            #print(f"[worker] no streams: {new_member_name}", flush=True)
             return None
 
         of = _ensure_seekable(of)
