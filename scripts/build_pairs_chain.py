@@ -281,7 +281,7 @@ def _process_member(args):
         except Exception:
             pass
 
-    print(f"[worker] done: {new_member_name} (pairs={written})", flush=True)
+    #print(f"[worker] done: {new_member_name} (pairs={written})", flush=True)
     return (out_path, written)
 
 # ===================== Main =====================
