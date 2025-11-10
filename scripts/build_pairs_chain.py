@@ -4,7 +4,7 @@
 
 import argparse, base64, json, os, tarfile, tempfile, uuid, time, sqlite3, hashlib
 from typing import Iterator, Tuple, Optional, List
-from multiprocessing import Pool, cpu_count
+from multiprocessing import cpu_count, get_context
 from bisect import bisect_right
 from contextlib import nullcontext
 
@@ -87,8 +87,17 @@ def make_old_block_lookup(idx_path: str, block_size: int, cache_cap: int = 8192)
     Return lookup(new_blk[B]) -> old_off or None, using the per-member SQLite index.
     Pads to B before hashing (the index is built on padded B blocks).
     """
-    conn = sqlite3.connect(idx_path, check_same_thread=False)
+    # Read-only connection with friendlier pragmas
+    conn = sqlite3.connect(idx_path, timeout=60, check_same_thread=False)
     cur = conn.cursor()
+    try:
+        cur.execute("PRAGMA journal_mode=OFF;")
+        cur.execute("PRAGMA synchronous=OFF;")
+        cur.execute("PRAGMA temp_store=MEMORY;")
+        cur.execute("PRAGMA locking_mode=EXCLUSIVE;")
+        cur.execute("PRAGMA busy_timeout=60000;")
+    except Exception:
+        pass
 
     from collections import OrderedDict
     lru = OrderedDict()
@@ -114,15 +123,18 @@ def make_old_block_lookup(idx_path: str, block_size: int, cache_cap: int = 8192)
 
 # ===================== Anchor helpers =====================
 
-def build_anchor_maps(regions: List[Tuple]) -> Tuple[List[int], List[Tuple[int,int]]]:
+def build_anchor_maps_stream(new_seek, idx_path: str, B: int, cache_size: int) -> Tuple[List[int], List[Tuple[int,int]]]:
     """
-    From matcher regions, collect COPY anchors as (n_pos, o_pos) along NEW.
-    Returns (copy_positions_in_new, anchors list).
+    1st streaming pass: collect only COPY anchors (tiny).
+    Returns (copy_positions_in_new, anchors list of (n_pos, o_pos)).
     """
     anchors: List[Tuple[int,int]] = []
-    for r in regions:
-        if r[0] == "copy":
-            _, nstart, nlen, ostart = r
+    new_seek.seek(0)
+    for rec in iter_matches_and_unmatched_stream_sqlcached(new_seek, idx_path, block_size=B, cache_size=cache_size):
+        kind = rec[0]
+        if kind == "copy":
+            # ("copy", nstart, nlen, ostart)
+            _, nstart, _nlen, ostart = rec
             anchors.append((int(nstart), int(ostart)))
     anchors.sort(key=lambda x: x[0])
     copy_positions = [a[0] for a in anchors]
@@ -149,42 +161,46 @@ def bi_anchor_map(n: int, pa: Optional[Tuple[int,int]], na: Optional[Tuple[int,i
     ratio = (n - n0) / float(n1 - n0)
     return int(round(o0 + ratio * (o1 - o0)))
 
-# ============== Tiling emitter (Option A, with valid lengths) ==============
+# ============== Streaming tiling emitter (no giant regions list) ==============
 
-def emit_changed_tiles(old_seek,
-                       new_seek,
-                       regions: List[Tuple],
-                       B: int,
-                       stride: int,
-                       lookup_old_off,
-                       old_size: int,
-                       new_size: int
-                       ) -> Iterator[Tuple[bytes, bytes, int, int]]:
+def emit_changed_tiles_stream(old_seek,
+                              new_seek,
+                              idx_path: str,
+                              B: int,
+                              stride: int,
+                              cache_size: int,
+                              old_size: int,
+                              new_size: int) -> Iterator[Tuple[bytes, bytes, int, int]]:
     """
-    Iterate LITERAL spans, tile them into fixed B targets with 'stride',
-    skip tiles that exist anywhere in OLD (lookup hit),
+    Iterate LITERAL spans from the streaming matcher (2 passes; anchors are tiny),
+    tile them into fixed-B targets with 'stride', skip tiles that exist anywhere in OLD,
     map NEW→OLD via COPY anchors (bi-anchored) else same-offset fallback.
 
-    Yields (old_chunk[B], new_chunk[B], old_valid, new_valid)
+    Yields (old_chunk[B], new_chunk[B], old_valid, new_valid).
     """
-    copy_positions, anchors = build_anchor_maps(regions)
+    # 1) Small pass to capture COPY anchors
+    copy_positions, anchors = build_anchor_maps_stream(new_seek, idx_path, B, cache_size)
 
-    for r in regions:
-        if r[0] != "lit":
+    # 2) Streaming pass over matcher; only act on lit regions
+    lookup = make_old_block_lookup(idx_path, B, cache_cap=8192)
+    new_seek.seek(0)
+    for rec in iter_matches_and_unmatched_stream_sqlcached(new_seek, idx_path, block_size=B, cache_size=cache_size):
+        kind = rec[0]
+        if kind != "lit":
             continue
-        _, nstart, nlen = r
+        # ("lit", nstart, nlen)
+        _, nstart, nlen = rec
         nstart = int(nstart); nlen = int(nlen)
         end = nstart + nlen
         pos = nstart
 
         while pos < end:
-            # NEW tile: real NEW bytes before padding
             take = min(B, end - pos)
             new_valid = take
             new_chunk = _read_exact_with_pad(new_seek, pos, B)
 
             # Skip if NEW tile exists anywhere in OLD (unchanged or shifted copy)
-            if lookup_old_off(new_chunk) is not None:
+            if lookup(new_chunk) is not None:
                 pos += stride
                 continue
 
@@ -214,15 +230,11 @@ def _process_member(args):
         B, stride, cache_size, tmp_dir
     ) = args
 
-    # print a tiny heartbeat for long members
-    #print(f"[worker] starting: {new_member_name}", flush=True)
-
     with tarfile.open(old_tar_path, "r:*") as told, tarfile.open(new_tar_path, "r:*") as tnew:
         om = told.getmember(old_member_name)
         nm = tnew.getmember(new_member_name)
         # Only process regular files with size > 0 in NEW
         if not om.isfile() or not nm.isfile() or nm.size == 0:
-            #print(f"[worker] skip: {new_member_name}", flush=True)
             return None
 
         old_size = int(om.size)
@@ -231,11 +243,30 @@ def _process_member(args):
         of = told.extractfile(om)
         nf = tnew.extractfile(nm)
         if of is None or nf is None:
-            #print(f"[worker] no streams: {new_member_name}", flush=True)
             return None
 
         of = _ensure_seekable(of)
         nf = _ensure_seekable(nf)
+
+        # Tiny-file fast path: avoid DB setup for very small members
+        if new_size <= B:
+            of.seek(0); nf.seek(0)
+            old_chunk = _read_exact_with_pad(of, 0, B)
+            new_chunk = _read_exact_with_pad(nf, 0, B)
+            out_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}.jsonl")
+            with open(out_path, "w", encoding="utf-8") as fout:
+                rec = {
+                    "old": base64.b64encode(old_chunk).decode("ascii"),
+                    "new": base64.b64encode(new_chunk).decode("ascii"),
+                    "old_valid": int(min(B, old_size)),
+                    "new_valid": int(min(B, new_size)),
+                    "block": int(B),
+                    "stride": int(stride),
+                    "member_old": old_member_name,
+                    "member_new": new_member_name,
+                }
+                fout.write(json.dumps(rec) + "\n")
+            return (out_path, 1)
 
         # 1) Build OLD per-member index (SQLite)
         idx_path = os.path.join(tmp_dir, f"idx_{uuid.uuid4().hex}.sqlite")
@@ -243,23 +274,13 @@ def _process_member(args):
         build_source_index_sqlite_stream(of, idx_path, block_size=B)
         of.seek(0)
 
-        # 2) Stream NEW to get COPY/LITERAL regions
-        nf.seek(0)
-        regions = list(
-            iter_matches_and_unmatched_stream_sqlcached(
-                nf, idx_path, block_size=B, cache_size=cache_size
-            )
-        )
-
-        # 3) Emit changed-only tiles with valid lengths
-        lookup = make_old_block_lookup(idx_path, B, cache_cap=8192)
+        # 2) Emit changed-only tiles with valid lengths (fully streaming)
         nf.seek(0); of.seek(0)
-
         out_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}.jsonl")
         written = 0
         with open(out_path, "w", encoding="utf-8") as fout:
-            for old_chunk, new_chunk, old_valid, new_valid in emit_changed_tiles(
-                of, nf, regions, B=B, stride=stride, lookup_old_off=lookup,
+            for old_chunk, new_chunk, old_valid, new_valid in emit_changed_tiles_stream(
+                of, nf, idx_path, B=B, stride=stride, cache_size=cache_size,
                 old_size=old_size, new_size=new_size
             ):
                 rec = {
@@ -281,10 +302,55 @@ def _process_member(args):
         except Exception:
             pass
 
-    #print(f"[worker] done: {new_member_name} (pairs={written})", flush=True)
     return (out_path, written)
 
 # ===================== Main =====================
+
+def _run_phase(tasks: List[tuple], jobs: int, chunksize: int, use_tqdm: bool, desc: str) -> Tuple[int, List[str]]:
+    """
+    Run a batch of member tasks with a recycled Pool and streaming iterator.
+    Returns (total_pairs_written, list_of_shard_paths).
+    """
+    t0 = time.time()
+    total = len(tasks)
+    total_pairs = 0
+    shard_paths: List[str] = []
+
+    ctx = get_context("spawn")
+    with ctx.Pool(processes=jobs, maxtasksperchild=8) as pool:
+        iterator = pool.imap_unordered(_process_member, tasks, chunksize=chunksize)
+
+        pbar = None
+        if use_tqdm:
+            try:
+                from tqdm import tqdm
+                pbar = tqdm(total=total, unit="file", dynamic_ncols=True, desc=desc)
+            except Exception:
+                pbar = None
+
+        if pbar is not None:
+            with pbar:
+                for res in iterator:
+                    if res is not None:
+                        out_path, written = res
+                        shard_paths.append(out_path)
+                        total_pairs += written
+                    pbar.update(1)
+        else:
+            done = 0
+            for res in iterator:
+                done += 1
+                if res is not None:
+                    out_path, written = res
+                    shard_paths.append(out_path)
+                    total_pairs += written
+                if done % 500 == 0:
+                    elapsed = time.time() - t0
+                    rate = done / elapsed if elapsed > 0 else 0.0
+                    pct = (done / total * 100.0) if total else 100.0
+                    print(f"[{desc}] {done}/{total} ({pct:.1f}%) | {rate:.2f} members/s | elapsed={_fmt_dur(elapsed)}")
+
+    return total_pairs, shard_paths
 
 def main():
     ap = argparse.ArgumentParser(description="Build OLD→NEW training pairs from rsync-style literal spans (Option A)")
@@ -292,11 +358,12 @@ def main():
     ap.add_argument("--stride", type=int, default=4096, help="Tile stride (B=no overlap, B//2=50% overlap)")
     ap.add_argument("--out", required=True, help="Output JSONL of {old,new,old_valid,new_valid,...} pairs")
     ap.add_argument("--chain", nargs=2, required=True, help="Exactly two tar paths: OLD.tar NEW.tar")
-    ap.add_argument("--jobs", type=int, default=max(1, cpu_count()-1), help="Parallel workers")
+    ap.add_argument("--jobs", type=int, default=max(1, cpu_count()-1), help="Parallel workers for the SMALL phase")
+    ap.add_argument("--big_jobs", type=int, default=4, help="Parallel workers for the BIG phase")
+    ap.add_argument("--big_threshold", type=int, default=16*1024*1024, help="Bytes; members > threshold are BIG")
     ap.add_argument("--limit", type=int, default=0, help="(Debug) limit number of members processed")
-    ap.add_argument("--progress_every", type=int, default=500, help="Print progress every N members (when --tqdm not used)")
-    ap.add_argument("--cache_size", type=int, default=65536, help="LRU size for weak→candidates in streaming matcher")
-    ap.add_argument("--pool_chunksize", type=int, default=1, help="chunksize for imap_unordered batching (1 = most responsive)")
+    ap.add_argument("--cache_size", type=int, default=8192, help="LRU size for weak→candidates in streaming matcher")
+    ap.add_argument("--pool_chunksize", type=int, default=1, help="chunksize for imap_unordered batching (1 = best balance)")
     ap.add_argument("--tqdm", action="store_true", help="Show a tqdm progress bar")
     args = ap.parse_args()
 
@@ -318,57 +385,27 @@ def main():
     tmp_dir = tempfile.mkdtemp(prefix="pairs_tmp_")
     print(f"[info] writing per-worker shards under: {tmp_dir}")
 
-    tasks = [
-        (old_tar_path, new_tar_path, old_name, new_name, B, stride, args.cache_size, tmp_dir)
-        for (old_name, new_name, _sz) in pairs
-    ]
+    # Partition tasks into SMALL and BIG by NEW size; run BIG with fewer workers to avoid RAM spikes
+    small_tasks, big_tasks = [], []
+    TH = int(args.big_threshold)
+    for (old_name, new_name, sz) in pairs:
+        task = (old_tar_path, new_tar_path, old_name, new_name, B, stride, args.cache_size, tmp_dir)
+        (small_tasks if sz <= TH else big_tasks).append(task)
 
-    # Progress helpers
-    def _status(done: int, total: int):
-        elapsed = time.time() - t0
-        rate = done / elapsed if elapsed > 0 and done > 0 else 0.0
-        remain = total - done
-        eta = remain / rate if rate > 0 else float("inf")
-        pct = (done / total * 100.0) if total else 100.0
-        eta_txt = "∞" if eta == float("inf") else _fmt_dur(eta)
-        print(f"[progress] {done}/{total} ({pct:.1f}%) | elapsed={_fmt_dur(elapsed)} | eta={eta_txt} | ~{rate:.2f} members/s")
+    # Phase 1: SMALL with full parallelism
+    print(f"[phase] SMALL: {len(small_tasks)} members (<= {TH} bytes) with jobs={args.jobs}")
+    pairs_small, shards_small = _run_phase(small_tasks, jobs=args.jobs, chunksize=args.pool_chunksize, use_tqdm=args.tqdm, desc="Members (small)")
 
-    total_pairs = 0
-    progress = 0
-    with Pool(processes=args.jobs) as pool:
-        iterator = pool.imap_unordered(_process_member, tasks, chunksize=args.pool_chunksize)
+    # Phase 2: BIG with reduced parallelism (default 4) to cap peak RSS
+    print(f"[phase] BIG: {len(big_tasks)} members (> {TH} bytes) with jobs={args.big_jobs}")
+    pairs_big, shards_big = _run_phase(big_tasks, jobs=args.big_jobs, chunksize=args.pool_chunksize, use_tqdm=args.tqdm, desc="Members (big)")
 
-        # Optional tqdm progress bar
-        bar_cm = nullcontext()
-        pbar = None
-        if args.tqdm:
-            try:
-                from tqdm import tqdm
-                pbar = tqdm(total=total_members, unit="file", dynamic_ncols=True, desc="Members")
-            except Exception:
-                pbar = None
-
-        if pbar is not None:
-            with pbar:
-                for res in iterator:
-                    progress += 1
-                    if res is not None:
-                        out_path, written = res
-                        total_pairs += written
-                    pbar.update(1)
-        else:
-            for res in iterator:
-                progress += 1
-                if res is not None:
-                    out_path, written = res
-                    total_pairs += written
-                if progress % args.progress_every == 0:
-                    _status(progress, total_members)
+    total_pairs = pairs_small + pairs_big
+    shards = shards_small + shards_big
 
     # Final status
-    if pbar is None:
-        _status(progress, total_members)
-    print(f"[info] concatenating shards → {args.out}")
+    elapsed = time.time() - t0
+    print(f"[info] concatenating {len(shards)} shards → {args.out}")
 
     # Ensure out dir
     out_dir = os.path.dirname(args.out)
@@ -377,17 +414,18 @@ def main():
 
     # Concatenate per-worker shards
     with open(args.out, "w", encoding="utf-8") as fout:
-        for fname in os.listdir(tmp_dir):
-            if not fname.endswith(".jsonl"):
-                continue
-            with open(os.path.join(tmp_dir, fname), "r", encoding="utf-8") as fin:
-                for line in fin:
-                    fout.write(line)
+        for shard in shards:
+            try:
+                with open(shard, "r", encoding="utf-8") as fin:
+                    for line in fin:
+                        fout.write(line)
+            except Exception as e:
+                print(f"[warn] failed to read shard {shard}: {e}")
 
     # Cleanup temp shards
-    for fname in os.listdir(tmp_dir):
+    for shard in shards:
         try:
-            os.remove(os.path.join(tmp_dir, fname))
+            os.remove(shard)
         except Exception:
             pass
     try:
@@ -395,9 +433,10 @@ def main():
     except Exception:
         pass
 
-    print(f"[done] Wrote {total_pairs} changed-only pairs (B={B}, stride={stride}, jobs={args.jobs}) → {args.out}")
-    print(f"[time] total elapsed = {_fmt_dur(time.time() - t0)}")
+    print(f"[done] Wrote {total_pairs} changed-only pairs (B={B}, stride={stride}, jobs={args.jobs}/{args.big_jobs}) → {args.out}")
+    print(f"[time] total elapsed = {_fmt_dur(elapsed)}")
 
 if __name__ == "__main__":
     main()
+
 
