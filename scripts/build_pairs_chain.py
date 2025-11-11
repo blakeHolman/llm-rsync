@@ -4,9 +4,10 @@
 
 import argparse, base64, json, os, tarfile, tempfile, uuid, time, sqlite3, hashlib
 from typing import Iterator, Tuple, Optional, List
-from multiprocessing import cpu_count, get_context
 from bisect import bisect_right
 from contextlib import nullcontext
+from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
+import multiprocessing as mp
 
 from rsync_match import (
     build_source_index_sqlite_stream,
@@ -56,7 +57,7 @@ def _read_exact_with_pad(f, off: int, ln: int) -> bytes:
 
 # =========== Member matching (normalized names) ===========
 
-def _common_members(old_tar: tarfile.TarFile, new_tar: tarfile.TarFile) -> List[Tuple[str, str, int]]:
+def _common_members(old_tar: tarfile.TarFile, new_tar: tarfile.TarFile):
     """
     Return list of (old_member_name, new_member_name, new_size), matching after
     stripping the top-level directory prefix (e.g., 'linux-6.1.154/').
@@ -87,7 +88,6 @@ def make_old_block_lookup(idx_path: str, block_size: int, cache_cap: int = 8192)
     Return lookup(new_blk[B]) -> old_off or None, using the per-member SQLite index.
     Pads to B before hashing (the index is built on padded B blocks).
     """
-    # Read-only connection with friendlier pragmas
     conn = sqlite3.connect(idx_path, timeout=60, check_same_thread=False)
     cur = conn.cursor()
     try:
@@ -121,73 +121,44 @@ def make_old_block_lookup(idx_path: str, block_size: int, cache_cap: int = 8192)
 
     return lookup
 
-# ===================== Anchor helpers =====================
+# ============== Single-pass tiling emitter (constant memory) ==============
 
-def build_anchor_maps_stream(new_seek, idx_path: str, B: int, cache_size: int) -> Tuple[List[int], List[Tuple[int,int]]]:
+def emit_changed_tiles_singlepass(old_seek,
+                                  new_seek,
+                                  idx_path: str,
+                                  B: int,
+                                  stride: int,
+                                  cache_size: int,
+                                  old_size: int,
+                                  new_size: int) -> Iterator[Tuple[bytes, bytes, int, int]]:
     """
-    1st streaming pass: collect only COPY anchors (tiny).
-    Returns (copy_positions_in_new, anchors list of (n_pos, o_pos)).
+    Single-pass over the streaming matcher:
+      - Track only the LAST copy anchor (n_prev, o_prev).
+      - For each 'lit' span, tile it; for each tile, estimate OLD start as:
+          o_start = (o_prev + (pos - n_prev)) if we have a prev anchor,
+                    else same-offset fallback o_start = pos (clamped).
+      - Skip tiles that exist anywhere in OLD via per-member index lookup.
+    This uses O(1) memory regardless of member size.
     """
-    anchors: List[Tuple[int,int]] = []
+    lookup = make_old_block_lookup(idx_path, B, cache_cap=8192)
+
+    n_prev = None  # last copy NEW offset
+    o_prev = None  # last copy OLD offset
+
     new_seek.seek(0)
     for rec in iter_matches_and_unmatched_stream_sqlcached(new_seek, idx_path, block_size=B, cache_size=cache_size):
         kind = rec[0]
+
         if kind == "copy":
             # ("copy", nstart, nlen, ostart)
-            _, nstart, _nlen, ostart = rec
-            anchors.append((int(nstart), int(ostart)))
-    anchors.sort(key=lambda x: x[0])
-    copy_positions = [a[0] for a in anchors]
-    return copy_positions, anchors
+            _, nstart, nlen, ostart = rec
+            n_prev = int(nstart)
+            o_prev = int(ostart)
+            continue
 
-def prev_anchor(n_pos: int, copy_positions: List[int], anchors: List[Tuple[int,int]]) -> Optional[Tuple[int,int]]:
-    i = bisect_right(copy_positions, n_pos) - 1
-    return anchors[i] if i >= 0 else None
-
-def next_anchor(n_pos: int, copy_positions: List[int], anchors: List[Tuple[int,int]]) -> Optional[Tuple[int,int]]:
-    i = bisect_right(copy_positions, n_pos)
-    return anchors[i] if i < len(anchors) else None
-
-def bi_anchor_map(n: int, pa: Optional[Tuple[int,int]], na: Optional[Tuple[int,int]]) -> Optional[int]:
-    """
-    Map NEW byte position n → OLD position using linear interpolation between nearest
-    previous/next COPY anchors. Return None if not possible.
-    """
-    if not pa or not na:
-        return None
-    n0, o0 = pa; n1, o1 = na
-    if n1 == n0:
-        return None
-    ratio = (n - n0) / float(n1 - n0)
-    return int(round(o0 + ratio * (o1 - o0)))
-
-# ============== Streaming tiling emitter (no giant regions list) ==============
-
-def emit_changed_tiles_stream(old_seek,
-                              new_seek,
-                              idx_path: str,
-                              B: int,
-                              stride: int,
-                              cache_size: int,
-                              old_size: int,
-                              new_size: int) -> Iterator[Tuple[bytes, bytes, int, int]]:
-    """
-    Iterate LITERAL spans from the streaming matcher (2 passes; anchors are tiny),
-    tile them into fixed-B targets with 'stride', skip tiles that exist anywhere in OLD,
-    map NEW→OLD via COPY anchors (bi-anchored) else same-offset fallback.
-
-    Yields (old_chunk[B], new_chunk[B], old_valid, new_valid).
-    """
-    # 1) Small pass to capture COPY anchors
-    copy_positions, anchors = build_anchor_maps_stream(new_seek, idx_path, B, cache_size)
-
-    # 2) Streaming pass over matcher; only act on lit regions
-    lookup = make_old_block_lookup(idx_path, B, cache_cap=8192)
-    new_seek.seek(0)
-    for rec in iter_matches_and_unmatched_stream_sqlcached(new_seek, idx_path, block_size=B, cache_size=cache_size):
-        kind = rec[0]
         if kind != "lit":
             continue
+
         # ("lit", nstart, nlen)
         _, nstart, nlen = rec
         nstart = int(nstart); nlen = int(nlen)
@@ -204,22 +175,44 @@ def emit_changed_tiles_stream(old_seek,
                 pos += stride
                 continue
 
-            # Map NEW position to OLD via anchors; fallback to same-offset
-            pa = prev_anchor(pos, copy_positions, anchors)
-            na = next_anchor(pos, copy_positions, anchors)
-            o_start = bi_anchor_map(pos, pa, na)
-            if o_start is None:
-                o_start = max(0, pos)
+            # Map NEW position to OLD using last anchor; else same-offset fallback
+            if n_prev is not None and o_prev is not None:
+                o_start = o_prev + (pos - n_prev)
+            else:
+                o_start = pos
 
-            # OLD tile + valid length (cap by file size)
+            if o_start < 0:
+                o_start = 0
             if o_start >= old_size:
                 old_valid = 0
             else:
                 old_valid = min(B, old_size - o_start)
+
             old_chunk = _read_exact_with_pad(old_seek, o_start, B)
 
             yield old_chunk, new_chunk, int(old_valid), int(new_valid)
             pos += stride
+
+# ============== Lossless literal fallback for a member ==============
+
+def emit_literal_member_pairs(old_seek, new_seek, B: int, stride: int,
+                              old_size: int, new_size: int) -> Iterator[Tuple[bytes, bytes, int, int]]:
+    """
+    Emit literal tiles without any matching (lossless: preserves all bytes via valid lengths).
+    Useful as a timeout/oom fallback.
+    """
+    pos = 0
+    while pos < new_size:
+        take = min(B, new_size - pos)
+        new_chunk = _read_exact_with_pad(new_seek, pos, B)
+        o_start = pos
+        if o_start >= old_size:
+            old_valid = 0
+        else:
+            old_valid = min(B, old_size - o_start)
+        old_chunk = _read_exact_with_pad(old_seek, o_start, B)
+        yield old_chunk, new_chunk, int(old_valid), int(take)
+        pos += stride
 
 # ===================== Worker (per member) =====================
 
@@ -227,8 +220,11 @@ def _process_member(args):
     (
         old_tar_path, new_tar_path,
         old_member_name, new_member_name,
-        B, stride, cache_size, tmp_dir
+        B, stride, cache_size, tmp_dir,
+        member_timeout_s, big_literal_fallback, big_threshold
     ) = args
+
+    t_start = time.time()
 
     with tarfile.open(old_tar_path, "r:*") as told, tarfile.open(new_tar_path, "r:*") as tnew:
         om = told.getmember(old_member_name)
@@ -268,21 +264,68 @@ def _process_member(args):
                 fout.write(json.dumps(rec) + "\n")
             return (out_path, 1)
 
-        # 1) Build OLD per-member index (SQLite)
+        # Optional: if "big literal fallback" is enabled for very large members,
+        # skip matching completely to avoid RAM spikes.
+        if big_literal_fallback and new_size >= big_threshold:
+            nf.seek(0); of.seek(0)
+            out_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}.jsonl")
+            written = 0
+            with open(out_path, "w", encoding="utf-8") as fout:
+                for old_chunk, new_chunk, old_valid, new_valid in emit_literal_member_pairs(
+                    of, nf, B=B, stride=stride, old_size=old_size, new_size=new_size
+                ):
+                    rec = {
+                        "old": base64.b64encode(old_chunk).decode("ascii"),
+                        "new": base64.b64encode(new_chunk).decode("ascii"),
+                        "old_valid": int(old_valid),
+                        "new_valid": int(new_valid),
+                        "block": int(B),
+                        "stride": int(stride),
+                        "member_old": old_member_name,
+                        "member_new": new_member_name,
+                    }
+                    fout.write(json.dumps(rec) + "\n")
+                    written += 1
+            return (out_path, written)
+
+        # Build OLD per-member index (SQLite)
         idx_path = os.path.join(tmp_dir, f"idx_{uuid.uuid4().hex}.sqlite")
         of.seek(0)
         build_source_index_sqlite_stream(of, idx_path, block_size=B)
         of.seek(0)
 
-        # 2) Emit changed-only tiles with valid lengths (fully streaming)
+        # Emit changed-only tiles with valid lengths (single-pass; constant memory)
         nf.seek(0); of.seek(0)
         out_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}.jsonl")
         written = 0
+
         with open(out_path, "w", encoding="utf-8") as fout:
-            for old_chunk, new_chunk, old_valid, new_valid in emit_changed_tiles_stream(
+            for old_chunk, new_chunk, old_valid, new_valid in emit_changed_tiles_singlepass(
                 of, nf, idx_path, B=B, stride=stride, cache_size=cache_size,
                 old_size=old_size, new_size=new_size
             ):
+                # Per-member timeout: bail to literal tiling if taking too long
+                if member_timeout_s > 0 and (time.time() - t_start) > member_timeout_s:
+                    # Finish remaining bytes with lossless literal fallback
+                    nf_pos = nf.seek(0, os.SEEK_CUR)  # best-effort; some fileobjs don't tell pos
+                    nf.seek(nf_pos if isinstance(nf_pos, int) else 0)
+                    for o2, n2, ov2, nv2 in emit_literal_member_pairs(
+                        of, nf, B=B, stride=stride, old_size=old_size, new_size=new_size
+                    ):
+                        rec = {
+                            "old": base64.b64encode(o2).decode("ascii"),
+                            "new": base64.b64encode(n2).decode("ascii"),
+                            "old_valid": int(ov2),
+                            "new_valid": int(nv2),
+                            "block": int(B),
+                            "stride": int(stride),
+                            "member_old": old_member_name,
+                            "member_new": new_member_name,
+                        }
+                        fout.write(json.dumps(rec) + "\n")
+                        written += 1
+                    break
+
                 rec = {
                     "old": base64.b64encode(old_chunk).decode("ascii"),
                     "new": base64.b64encode(new_chunk).decode("ascii"),
@@ -306,65 +349,20 @@ def _process_member(args):
 
 # ===================== Main =====================
 
-def _run_phase(tasks: List[tuple], jobs: int, chunksize: int, use_tqdm: bool, desc: str) -> Tuple[int, List[str]]:
-    """
-    Run a batch of member tasks with a recycled Pool and streaming iterator.
-    Returns (total_pairs_written, list_of_shard_paths).
-    """
-    t0 = time.time()
-    total = len(tasks)
-    total_pairs = 0
-    shard_paths: List[str] = []
-
-    ctx = get_context("spawn")
-    with ctx.Pool(processes=jobs, maxtasksperchild=8) as pool:
-        iterator = pool.imap_unordered(_process_member, tasks, chunksize=chunksize)
-
-        pbar = None
-        if use_tqdm:
-            try:
-                from tqdm import tqdm
-                pbar = tqdm(total=total, unit="file", dynamic_ncols=True, desc=desc)
-            except Exception:
-                pbar = None
-
-        if pbar is not None:
-            with pbar:
-                for res in iterator:
-                    if res is not None:
-                        out_path, written = res
-                        shard_paths.append(out_path)
-                        total_pairs += written
-                    pbar.update(1)
-        else:
-            done = 0
-            for res in iterator:
-                done += 1
-                if res is not None:
-                    out_path, written = res
-                    shard_paths.append(out_path)
-                    total_pairs += written
-                if done % 500 == 0:
-                    elapsed = time.time() - t0
-                    rate = done / elapsed if elapsed > 0 else 0.0
-                    pct = (done / total * 100.0) if total else 100.0
-                    print(f"[{desc}] {done}/{total} ({pct:.1f}%) | {rate:.2f} members/s | elapsed={_fmt_dur(elapsed)}")
-
-    return total_pairs, shard_paths
-
 def main():
     ap = argparse.ArgumentParser(description="Build OLD→NEW training pairs from rsync-style literal spans (Option A)")
-    ap.add_argument("--block_size", type=int, default=4096, help="Tile size B (and rsync index block)")
-    ap.add_argument("--stride", type=int, default=4096, help="Tile stride (B=no overlap, B//2=50% overlap)")
+    ap.add_argument("--block_size", type=int, default=8192, help="Tile size B (and rsync index block)")
+    ap.add_argument("--stride", type=int, default=8192, help="Tile stride (B=no overlap, B//2=50% overlap)")
     ap.add_argument("--out", required=True, help="Output JSONL of {old,new,old_valid,new_valid,...} pairs")
     ap.add_argument("--chain", nargs=2, required=True, help="Exactly two tar paths: OLD.tar NEW.tar")
-    ap.add_argument("--jobs", type=int, default=max(1, cpu_count()-1), help="Parallel workers for the SMALL phase")
-    ap.add_argument("--big_jobs", type=int, default=4, help="Parallel workers for the BIG phase")
-    ap.add_argument("--big_threshold", type=int, default=16*1024*1024, help="Bytes; members > threshold are BIG")
-    ap.add_argument("--limit", type=int, default=0, help="(Debug) limit number of members processed")
-    ap.add_argument("--cache_size", type=int, default=8192, help="LRU size for weak→candidates in streaming matcher")
-    ap.add_argument("--pool_chunksize", type=int, default=1, help="chunksize for imap_unordered batching (1 = best balance)")
+    ap.add_argument("--jobs", type=int, default=max(1, mp.cpu_count()-1), help="Parallel workers")
+    ap.add_argument("--pool_chunksize", type=int, default=1, help="Task chunking (1 = best balance)")
+    ap.add_argument("--cache_size", type=int, default=8192, help="LRU size for streaming matcher")
     ap.add_argument("--tqdm", action="store_true", help="Show a tqdm progress bar")
+    ap.add_argument("--limit", type=int, default=0, help="(Debug) limit number of members")
+    ap.add_argument("--member_timeout", type=int, default=180, help="Seconds before falling back to literal tiling for a member (0=off)")
+    ap.add_argument("--big_literal_fallback", action="store_true", help="Process very large members in literal mode only")
+    ap.add_argument("--big_threshold", type=int, default=128*1024*1024, help="Bytes; members >= threshold use literal fallback when enabled")
     args = ap.parse_args()
 
     B = int(args.block_size)
@@ -385,27 +383,59 @@ def main():
     tmp_dir = tempfile.mkdtemp(prefix="pairs_tmp_")
     print(f"[info] writing per-worker shards under: {tmp_dir}")
 
-    # Partition tasks into SMALL and BIG by NEW size; run BIG with fewer workers to avoid RAM spikes
-    small_tasks, big_tasks = [], []
-    TH = int(args.big_threshold)
-    for (old_name, new_name, sz) in pairs:
-        task = (old_tar_path, new_tar_path, old_name, new_name, B, stride, args.cache_size, tmp_dir)
-        (small_tasks if sz <= TH else big_tasks).append(task)
+    tasks = [
+        (old_tar_path, new_tar_path, old_name, new_name, B, stride, args.cache_size, tmp_dir,
+         int(args.member_timeout), bool(args.big_literal_fallback), int(args.big_threshold))
+        for (old_name, new_name, _sz) in pairs
+    ]
 
-    # Phase 1: SMALL with full parallelism
-    print(f"[phase] SMALL: {len(small_tasks)} members (<= {TH} bytes) with jobs={args.jobs}")
-    pairs_small, shards_small = _run_phase(small_tasks, jobs=args.jobs, chunksize=args.pool_chunksize, use_tqdm=args.tqdm, desc="Members (small)")
+    # Run with ProcessPoolExecutor to support timeouts & better isolation
+    total_pairs = 0
+    shard_paths: List[str] = []
+    done = 0
 
-    # Phase 2: BIG with reduced parallelism (default 4) to cap peak RSS
-    print(f"[phase] BIG: {len(big_tasks)} members (> {TH} bytes) with jobs={args.big_jobs}")
-    pairs_big, shards_big = _run_phase(big_tasks, jobs=args.big_jobs, chunksize=args.pool_chunksize, use_tqdm=args.tqdm, desc="Members (big)")
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=args.jobs, mp_context=ctx, max_tasks_per_child=8) as ex:
+        futs = [ex.submit(_process_member, t) for t in tasks]
 
-    total_pairs = pairs_small + pairs_big
-    shards = shards_small + shards_big
+        pbar = None
+        if args.tqdm:
+            try:
+                from tqdm import tqdm
+                pbar = tqdm(total=total_members, unit="file", dynamic_ncols=True, desc="Members")
+            except Exception:
+                pbar = None
+
+        for fut in as_completed(futs):
+            try:
+                res = fut.result(timeout=None)
+            except TimeoutError:
+                # Shouldn't happen with as_completed, but keep for safety
+                res = None
+            except Exception as e:
+                # Fail-open: count progress, but no shard
+                res = None
+
+            done += 1
+            if res is not None:
+                out_path, written = res
+                shard_paths.append(out_path)
+                total_pairs += written
+
+            if pbar is not None:
+                pbar.update(1)
+            else:
+                if done % 500 == 0:
+                    elapsed = time.time() - t0
+                    rate = done / elapsed if elapsed > 0 else 0.0
+                    pct = (done / total_members * 100.0) if total_members else 100.0
+                    print(f"[progress] {done}/{total_members} ({pct:.1f}%) | {rate:.2f} members/s | elapsed={_fmt_dur(elapsed)}")
 
     # Final status
+    if pbar is not None:
+        pbar.close()
     elapsed = time.time() - t0
-    print(f"[info] concatenating {len(shards)} shards → {args.out}")
+    print(f"[info] concatenating {len(shard_paths)} shards → {args.out}")
 
     # Ensure out dir
     out_dir = os.path.dirname(args.out)
@@ -414,7 +444,7 @@ def main():
 
     # Concatenate per-worker shards
     with open(args.out, "w", encoding="utf-8") as fout:
-        for shard in shards:
+        for shard in shard_paths:
             try:
                 with open(shard, "r", encoding="utf-8") as fin:
                     for line in fin:
@@ -423,7 +453,7 @@ def main():
                 print(f"[warn] failed to read shard {shard}: {e}")
 
     # Cleanup temp shards
-    for shard in shards:
+    for shard in shard_paths:
         try:
             os.remove(shard)
         except Exception:
@@ -433,7 +463,7 @@ def main():
     except Exception:
         pass
 
-    print(f"[done] Wrote {total_pairs} changed-only pairs (B={B}, stride={stride}, jobs={args.jobs}/{args.big_jobs}) → {args.out}")
+    print(f"[done] Wrote {total_pairs} changed-only pairs (B={B}, stride={stride}, jobs={args.jobs}) → {args.out}")
     print(f"[time] total elapsed = {_fmt_dur(elapsed)}")
 
 if __name__ == "__main__":
